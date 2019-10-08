@@ -64,6 +64,7 @@ import java.net.URLClassLoader;
 import java.util.AbstractMap;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
@@ -74,11 +75,11 @@ import org.aspectj.apache.bcel.util.ClassLoaderRepository.SoftHashMap.SpecialVal
 
 /**
  * The repository maintains information about which classes have been loaded.
- * 
+ *
  * It loads its data from the ClassLoader implementation passed into its constructor.
- * 
+ *
  * @see org.aspectj.apache.bcel.Repository
- * 
+ *
  * @version $Id: ClassLoaderRepository.java,v 1.13 2009/09/09 19:56:20 aclement Exp $
  * @author <A HREF="mailto:markus.dahm@berlin.de">M. Dahm</A>
  * @author David Dixon-Peugh
@@ -92,9 +93,19 @@ public class ClassLoaderRepository implements Repository {
 	private static SoftHashMap /* <URL,JavaClass> */sharedCache = new SoftHashMap(Collections.synchronizedMap(new HashMap<Object, SpecialValue>()));
 
 	// For fast translation of the classname *intentionally not static*
-	private SoftHashMap /* <String,URL> */nameMap = new SoftHashMap(new HashMap(), false);
+	private SoftHashMap /* <String,URL> */ nameMap = new SoftHashMap(new HashMap(), false);
 
 	public static boolean useSharedCache = System.getProperty("org.aspectj.apache.bcel.useSharedCache", "true").equalsIgnoreCase("true");
+
+	//Cache not found classes as well to prevent unnecessary file I/O operations
+	public static final boolean useUnavailableClassesCache =
+		System.getProperty("org.aspectj.apache.bcel.useUnavailableClassesCache", "true").equalsIgnoreCase("true");
+	//Ignore cache clear requests to not build up the cache over and over again
+	public static final boolean ignoreCacheClearRequests =
+		System.getProperty("org.aspectj.apache.bcel.ignoreCacheClearRequests", "true").equalsIgnoreCase("true");
+
+	//Second cache for the unavailable classes
+	private static Set<String> unavailableClasses = new HashSet<String>();
 
 	private static int cacheHitsShared = 0;
 	private static int missSharedEvicted = 0; // Misses in shared cache access due to reference GC
@@ -104,6 +115,16 @@ public class ClassLoaderRepository implements Repository {
 	private int misses = 0;
 	private int cacheHitsLocal = 0;
 	private int missLocalEvicted = 0; // Misses in local cache access due to reference GC
+
+	//    private static int cntHitFromCache = 0;
+	//    private static int cntLoadAndParseClass = 0;
+	//    private static int cntClassPutInCache = 0;
+	//    private static int cntClassRemovedFromCache = 0;
+	//    private static int cntCacheCleared = 0;
+	//    private static int cntLoadClassCount = 0;
+	//    private static int cntClassNotFound = 0;
+	//    private static int cntClassNotFoundViaCache;
+	//    private static int cntValueFromCacheGotGarbageCollected;
 
 	public ClassLoaderRepository(java.lang.ClassLoader loader) {
 		this.loaderRef = new DefaultClassLoaderReference((loader != null) ? loader : getBootClassLoader());
@@ -163,6 +184,7 @@ public class ClassLoaderRepository implements Repository {
 			if (value.get() == null) {
 				// it got GC'd
 				map.remove(value.key);
+				//                cntValueFromCacheGotGarbageCollected++;
 				if (recordMiss)
 					missSharedEvicted++;
 				return null;
@@ -184,8 +206,12 @@ public class ClassLoaderRepository implements Repository {
 
 		@Override
 		public void clear() {
-			processQueue();
-			map.clear();
+			if (!ignoreCacheClearRequests)
+			{
+				//                cntCacheCleared++;
+				processQueue();
+				map.clear();
+			}
 		}
 
 		@Override
@@ -211,6 +237,7 @@ public class ClassLoaderRepository implements Repository {
 	 * Store a new JavaClass into this repository as a soft reference and return the reference
 	 */
 	private void storeClassAsReference(URL url, JavaClass clazz) {
+		//        cntClassPutInCache++;
 		if (useSharedCache) {
 			clazz.setRepository(null); // can't risk setting repository, we'll get in a pickle!
 			sharedCache.put(url, clazz);
@@ -231,6 +258,7 @@ public class ClassLoaderRepository implements Repository {
 	 * Remove class from repository
 	 */
 	public void removeClass(JavaClass clazz) {
+		//        cntClassRemovedFromCache++;
 		if (useSharedCache)
 			sharedCache.remove(toURL(clazz.getClassName()));
 		else
@@ -282,12 +310,32 @@ public class ClassLoaderRepository implements Repository {
 	 */
 	public JavaClass loadClass(String className) throws ClassNotFoundException {
 
+		//        cntLoadClassCount++;
+		//        if (cntLoadClassCount % 10000 == 0)
+		//        {
+		//            logStatistics();
+		//        }
+
+		//Quick evaluation of unavailable classes to prevent unnecessary file I/O
+		if (useUnavailableClassesCache && unavailableClasses.contains(className))
+		{
+			//            cntClassNotFoundViaCache++;
+			throw new ClassNotFoundException(className + " not found.");
+		}
+
 		// translate to a URL
 		long time = System.currentTimeMillis();
 		java.net.URL url = toURL(className);
 		timeManipulatingURLs += (System.currentTimeMillis() - time);
 		if (url == null)
+		{
+			//            cntClassNotFound++;
+			if (useUnavailableClassesCache)
+			{
+				unavailableClasses.add(className);
+			}
 			throw new ClassNotFoundException(className + " not found - unable to determine URL");
+		}
 
 		JavaClass clazz = null;
 
@@ -296,11 +344,13 @@ public class ClassLoaderRepository implements Repository {
 			clazz = findClassShared(url);
 			if (clazz != null) {
 				cacheHitsShared++;
+				//                cntHitFromCache++;
 				return clazz;
 			}
 		} else {
 			clazz = findClassLocal(url);
 			if (clazz != null) {
+				//                cntHitFromCache++;
 				cacheHitsLocal++;
 				return clazz;
 			}
@@ -313,12 +363,18 @@ public class ClassLoaderRepository implements Repository {
 			// Load it
 			String classFile = className.replace('.', '/');
 			InputStream is = (useSharedCache ? url.openStream() : loaderRef.getClassLoader().getResourceAsStream(
-					classFile + ".class"));
+				classFile + ".class"));
 			if (is == null) {
+				//                cntClassNotFound++;
+				if (useUnavailableClassesCache)
+				{
+					unavailableClasses.add(className);
+				}
 				throw new ClassNotFoundException(className + " not found using url " + url);
 			}
 			ClassParser parser = new ClassParser(is, className);
 			clazz = parser.parse();
+			//            cntLoadAndParseClass++;
 
 			// Cache it
 			storeClassAsReference(url, clazz);
@@ -327,6 +383,8 @@ public class ClassLoaderRepository implements Repository {
 			classesLoadedCount++;
 			return clazz;
 		} catch (IOException e) {
+			//            cntClassNotFound++;
+			unavailableClasses.add(className);
 			throw new ClassNotFoundException(e.toString());
 		}
 	}
@@ -361,7 +419,7 @@ public class ClassLoaderRepository implements Repository {
 	 */
 	public long[] reportStats() {
 		return new long[] { timeSpentLoading, timeManipulatingURLs, classesLoadedCount, cacheHitsShared, missSharedEvicted,
-				cacheHitsLocal, missLocalEvicted, sharedCache.size() };
+			cacheHitsLocal, missLocalEvicted, sharedCache.size() };
 	}
 
 	/**
@@ -385,10 +443,36 @@ public class ClassLoaderRepository implements Repository {
 
 	/** Clear all entries from the local cache */
 	public void clear() {
-		if (useSharedCache)
-			sharedCache.clear();
-		else
-			localCache.clear();
+		if (!ignoreCacheClearRequests)
+		{
+			if (useSharedCache)
+				sharedCache.clear();
+			else
+				localCache.clear();
+		}
 	}
+
+	//    public void logStatistics()
+	//    {
+	//        //print out some statistic somewhere at the end
+	//        StringBuffer sb = new StringBuffer();
+	//        sb.append("****************************************\n");
+	//        sb.append("NonCachingClassLoaderRepository: " + this.toString() + "\n");
+	//        sb.append("cntHitFromCache: " + cntHitFromCache + "\n");
+	//        sb.append("cntLoadAndParseClass:" + cntLoadAndParseClass + "\n");
+	//        sb.append("cntClassPutInCache: " + cntClassPutInCache + "\n");
+	//        sb.append("cntClassNotFound: " + cntClassNotFound + "\n");
+	//        sb.append("cntClassNotFoundViaCache: " + cntClassNotFoundViaCache + "\n");
+	//        //sb.append("cacheSizeNotFoundClasses: " + unavailableClasses.size() + "\n");
+	//        sb.append("cacheSize: " + sharedCache.size() + "\n");
+	//        sb.append("cntClassRemovedFromCache: " + cntClassRemovedFromCache + "\n");
+	//        sb.append("cntValueFromCacheGotGarbageCollected: " + cntValueFromCacheGotGarbageCollected + "\n");
+	//        sb.append("cntCacheCleared: " + cntCacheCleared + "\n");
+	//        sb.append("cntLoadClassCount: " + cntLoadClassCount + "\n");
+	//        sb.append("****************************************\n");
+	//        System.out.println(sb.toString());
+	//
+	//        System.out.println(report());
+	//    }
 
 }
